@@ -1,0 +1,267 @@
+# Installed by ZIP to APK Converter. Do not edit: the app keeps this file up to date.
+name: Build APK
+run-name: Build ${{ inputs.build_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: Path of the uploaded ZIP inside this repo
+        required: true
+        type: string
+      build_id:
+        description: Unique id of this build
+        required: true
+        type: string
+      app_name:
+        description: App name
+        required: false
+        default: MyApp
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ZIP_PATH: ${{ inputs.zip_path }}
+      BUILD_ID: ${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download ZIP
+        uses: actions/checkout@v4
+
+      - name: Unpack ZIP
+        run: |
+          set -e
+          rm -rf /tmp/work && mkdir -p /tmp/work
+          unzip -q -o "$ZIP_PATH" -d /tmp/work
+          rm -rf /tmp/work/__MACOSX
+          find /tmp/work -name .DS_Store -delete
+          cd /tmp/work
+          while [ "$(ls -A | wc -l)" = "1" ] && [ -d "$(ls -A | head -n1)" ]; do
+            cd "$(ls -A | head -n1)"
+          done
+          echo "PROJECT_DIR=$(pwd)" >> "$GITHUB_ENV"
+          echo "Project folder: $(pwd)"
+          ls -la
+
+      - name: Detect project type
+        run: |
+          cd "$PROJECT_DIR"
+          JAVA_VERSION=17
+          if [ -f pubspec.yaml ]; then
+            T=flutter
+          elif [ -f capacitor.config.json ] || [ -f capacitor.config.ts ] || [ -f capacitor.config.js ]; then
+            T=capacitor
+            CAPMAJOR=$(grep -oE '"@capacitor/core"[[:space:]]*:[[:space:]]*"[^0-9]*[0-9]+' package.json 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true)
+            if [ -n "$CAPMAJOR" ] && [ "$CAPMAJOR" -ge 8 ]; then JAVA_VERSION=21; fi
+          elif [ -f package.json ] && grep -q '"expo"' package.json; then
+            T=expo
+          elif [ -f package.json ] && grep -q '"react-native"' package.json; then
+            T=reactnative
+          elif [ -f gradlew ] || [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            T=android
+          elif [ -n "$(find . -name index.html -not -path '*/node_modules/*' | head -n1)" ]; then
+            T=web
+          else
+            echo "::error::Could not recognise this project. Supported: Android (Gradle), Flutter, React Native, Expo, Capacitor, or an HTML/web project with index.html."
+            exit 1
+          fi
+          echo "PROJECT_TYPE=$T" >> "$GITHUB_ENV"
+          echo "JAVA_VERSION=$JAVA_VERSION" >> "$GITHUB_ENV"
+          echo "Detected project type: $T (Java $JAVA_VERSION)"
+          echo "Project type: **$T**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Node
+        if: ${{ contains(fromJSON('["web","capacitor","expo","reactnative"]'), env.PROJECT_TYPE) }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Flutter
+        if: ${{ env.PROJECT_TYPE == 'flutter' }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Prepare Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+
+      - name: Build APK
+        run: |
+          set -eo pipefail
+          cd "$PROJECT_DIR"
+
+          install_deps() {
+            if [ -f pnpm-lock.yaml ]; then
+              corepack enable && pnpm install
+            elif [ -f yarn.lock ]; then
+              corepack enable && yarn install
+            else
+              npm install --legacy-peer-deps --no-audit --no-fund
+            fi
+          }
+
+          has_build_script() {
+            node -e 'const p=require("./package.json"); process.exit(p.scripts && p.scripts.build ? 0 : 1)'
+          }
+
+          case "$PROJECT_TYPE" in
+            android)
+              BUILD_ROOT="$PROJECT_DIR"
+              if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+              $G assembleDebug --no-daemon --stacktrace
+              ;;
+
+            flutter)
+              BUILD_ROOT="$PROJECT_DIR"
+              [ -d android ] || flutter create --platforms=android .
+              flutter pub get
+              flutter build apk --release || flutter build apk --debug
+              ;;
+
+            expo)
+              BUILD_ROOT="$PROJECT_DIR"
+              install_deps
+              npx expo prebuild --platform android --no-install
+              cd android
+              chmod +x gradlew
+              ./gradlew assembleRelease --no-daemon --stacktrace
+              ;;
+
+            reactnative)
+              BUILD_ROOT="$PROJECT_DIR"
+              install_deps
+              if [ ! -d android ]; then
+                echo "::error::This React Native project has no android folder."
+                exit 1
+              fi
+              cd android
+              chmod +x gradlew
+              ./gradlew assembleRelease --no-daemon --stacktrace
+              ;;
+
+            capacitor)
+              BUILD_ROOT="$PROJECT_DIR"
+              install_deps
+              if has_build_script; then npm run build; fi
+              if [ ! -d android ]; then
+                npm ls @capacitor/android > /dev/null 2>&1 || npm install @capacitor/android --legacy-peer-deps
+                npx cap add android
+              fi
+              npx cap sync android
+              cd android
+              chmod +x gradlew
+              ./gradlew assembleDebug --no-daemon --stacktrace
+              ;;
+
+            web)
+              WEBDIR=""
+              if [ -f package.json ] && has_build_script; then
+                install_deps
+                npm run build
+                for d in dist build out public www; do
+                  if [ -f "$d/index.html" ]; then WEBDIR="$PROJECT_DIR/$d"; break; fi
+                done
+              fi
+              if [ -z "$WEBDIR" ]; then
+                IDX=$(find . -name index.html -not -path '*/node_modules/*' | awk '{ print gsub("/","/") " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+                WEBDIR="$PROJECT_DIR/$(dirname "$IDX")"
+              fi
+              echo "Web folder: $WEBDIR"
+
+              WRAP=/tmp/wrap
+              rm -rf "$WRAP" && mkdir -p "$WRAP/www"
+              cp -a "$WEBDIR"/. "$WRAP/www/"
+              cd "$WRAP"
+              SAFE_ID=$(echo "$BUILD_ID" | tr -cd 'a-z0-9')
+              npm init -y > /dev/null
+              npm install --no-audit --no-fund @capacitor/core@7 @capacitor/cli@7 @capacitor/android@7
+              jq -n --arg n "$APP_NAME" --arg id "com.zip2apk.b$SAFE_ID" '{appId:$id,appName:$n,webDir:"www"}' > capacitor.config.json
+              npx cap add android
+
+              ICON=""
+              for c in "$WEBDIR/icon.png" "$WEBDIR/icons/icon-512.png" "$WEBDIR/icon-512.png" "$WEBDIR/assets/icon.png" "$WEBDIR/logo.png" "$PROJECT_DIR/icon.png" "$PROJECT_DIR/icons/icon-512.png"; do
+                if [ -f "$c" ]; then ICON="$c"; break; fi
+              done
+              if [ -n "$ICON" ]; then
+                IM=$(command -v magick || command -v convert || true)
+                if [ -n "$IM" ]; then
+                  echo "Using app icon: $ICON"
+                  RES="$WRAP/android/app/src/main/res"
+                  rm -rf "$RES/mipmap-anydpi-v26"
+                  for pair in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+                    d="${pair%%:*}"; s="${pair##*:}"
+                    mkdir -p "$RES/mipmap-$d"
+                    "$IM" "$ICON" -resize "${s}x${s}" -background none -gravity center -extent "${s}x${s}" "$RES/mipmap-$d/ic_launcher.png"
+                    cp "$RES/mipmap-$d/ic_launcher.png" "$RES/mipmap-$d/ic_launcher_round.png"
+                  done
+                else
+                  echo "ImageMagick not found, keeping the default icon."
+                fi
+              fi
+
+              npx cap sync android
+              BUILD_ROOT="$WRAP"
+              cd android
+              chmod +x gradlew
+              ./gradlew assembleDebug --no-daemon --stacktrace
+              ;;
+          esac
+
+          APK=$(find "$BUILD_ROOT" -type f -name '*.apk' -path '*outputs*' -not -name '*androidTest*' -not -name '*unsigned*' -not -name '*unaligned*' -printf '%s %p\n' | sort -rn | head -n1 | cut -d' ' -f2- || true)
+
+          if [ -z "$APK" ]; then
+            U=$(find "$BUILD_ROOT" -type f -name '*unsigned*.apk' -path '*outputs*' | head -n1 || true)
+            if [ -n "$U" ]; then
+              echo "Only an unsigned APK was produced, signing it with a debug key."
+              keytool -genkeypair -keystore /tmp/z2a.jks -storepass android -keypass android -alias z2a -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=ZIP2APK"
+              BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+              "$BT/zipalign" -f 4 "$U" /tmp/z2a-aligned.apk
+              "$BT/apksigner" sign --ks /tmp/z2a.jks --ks-pass pass:android --key-pass pass:android --out /tmp/z2a-signed.apk /tmp/z2a-aligned.apk
+              APK=/tmp/z2a-signed.apk
+            fi
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "::error::Build finished but no APK was found."
+            exit 1
+          fi
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "Built: $APK"
+
+      - name: Publish APK
+        run: |
+          set -e
+          SLUG=$(echo "$APP_NAME" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-//; s/-$//')
+          [ -n "$SLUG" ] || SLUG=app
+          OUT="/tmp/${SLUG}-${BUILD_ID}.apk"
+          cp "$APK_PATH" "$OUT"
+          gh release create "build-$BUILD_ID" "$OUT" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$APP_NAME" \
+            --notes "Built from a ZIP ($PROJECT_TYPE project) by ZIP to APK Converter."
+
+      - name: Clean up ZIP
+        if: ${{ always() }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git config user.name "zip2apk"
+          git config user.email "zip2apk@users.noreply.github.com"
+          git pull --rebase -q || true
+          if [ -f "$ZIP_PATH" ]; then
+            git rm -q "$ZIP_PATH" && git commit -q -m "Remove $ZIP_PATH" && git push -q || true
+          fi
